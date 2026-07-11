@@ -1,61 +1,35 @@
 import asyncio
 import time
 
-from dataclasses import dataclass
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
+from app.types import BatchSizeConfig, InferenceJob, InferenceRequest, PolicyConfig
 from app.runtime_engine import RuntimeEngine
+from app.scheduler import RuntimeScheduler
+from app.policy import FIFOPolicy, PriorityPolicy, DeadlinePolicy
 
 app = FastAPI()
 
 engine = RuntimeEngine()
 
-request_queue: asyncio.Queue["InferenceJob"] = asyncio.Queue()
+POLICIES = {
+    "fifo": FIFOPolicy(),
+    "priority": PriorityPolicy(),
+    "deadline": DeadlinePolicy(),
+}
+active_policy = "fifo"
+scheduler = RuntimeScheduler(POLICIES[active_policy])
 
 max_batch_size = 1
-BATCH_TIMEOUT_S = 0.010
-
-class InferenceRequest(BaseModel):
-    prompt: str
-
-class BatchSizeConfig(BaseModel):
-    max_batch_size: int
-
-@dataclass
-class InferenceJob:
-    prompt: str
-    enqueued_at: float
-    future: asyncio.Future
+BATCH_TIMEOUT_MS = 25
 
 async def scheduler_loop():
-
     while True:
+        batch = await scheduler.get_batch(
+            max_batch_size=max_batch_size,
+            batch_timeout_ms=BATCH_TIMEOUT_MS,
+        )
 
-        first_job = await request_queue.get()
-        batch = [first_job]
-
-        batch_start = time.perf_counter()
-        deadline = batch_start + BATCH_TIMEOUT_S # only queue up to BATCH_TIMEOUT_S worth of jobs
-
-        # accumulate jobs until we reach the batch size or the deadline
-        while len(batch) < max_batch_size:
-
-            time_remaining = deadline - time.perf_counter()
-
-            if time_remaining <= 0:
-                break
-
-            try:
-                job = await asyncio.wait_for(
-                    request_queue.get(),
-                    timeout=time_remaining,
-                )
-                batch.append(job)
-
-            except asyncio.TimeoutError:
-                break
-        
         await process_batch(batch)
 
 async def process_batch(batch: list[InferenceJob]):
@@ -86,10 +60,6 @@ async def process_batch(batch: list[InferenceJob]):
     except Exception as e:
         for job in batch:
             job.future.set_exception(e)
-    
-    finally:
-        for _ in batch:
-            request_queue.task_done()
 
 @app.on_event("startup")
 async def startup_event():
@@ -101,12 +71,14 @@ async def infer(request: InferenceRequest):
 
     job = InferenceJob(
         prompt=request.prompt,
+        priority=request.priority,
+        deadline_ms=request.deadline_ms,
+        request_type=request.request_type,
         enqueued_at=time.perf_counter(),
         future=loop.create_future(),
     )
 
-    await request_queue.put(job)
-
+    await scheduler.submit(job)
     return await job.future
 
 @app.get("/health")
@@ -124,3 +96,20 @@ async def set_batch_size(config: BatchSizeConfig):
         raise HTTPException(status_code=400, detail="max_batch_size must be at least 1")
     max_batch_size = config.max_batch_size
     return {"max_batch_size": max_batch_size}
+
+@app.get("/config/policy")
+async def get_policy():
+    return {"policy": active_policy, "available": list(POLICIES.keys())}
+
+@app.post("/config/policy")
+async def set_policy(config: PolicyConfig):
+    global active_policy
+    policy_name = config.policy.lower()
+    if policy_name not in POLICIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown policy '{config.policy}'. Available: {list(POLICIES.keys())}",
+        )
+    active_policy = policy_name
+    scheduler.policy = POLICIES[policy_name]
+    return {"policy": active_policy}
