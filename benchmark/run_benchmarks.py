@@ -8,7 +8,7 @@ import time
 BENCHMARK_CONFIGS = [
     # (300, 16, 8, "fifo"),
     # (300, 32, 8, "fifo"),
-    # (100, 32, 8, "priority"),
+    (50, 32, 8, "priority"),
     # (300, 32, 8, "deadline"),
     # (300, 64, 8, "fifo"),
 ]
